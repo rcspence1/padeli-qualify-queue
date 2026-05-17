@@ -44,6 +44,97 @@ const CLUB_TRACKER_DB = '35bd1b51-fb30-8106-a719-ec603a1a3616';
 const NOTION_BASE = 'https://api.notion.com/v1';
 const NOTION_VERSION = '2022-06-28';
 
+// Playtomic catch-all tenant IDs — match ANY search query, not real venues.
+// Detected via scripts/scan-catchall-tenants.js — any tenant appearing 10+ times
+// across unrelated venues in a country is a catch-all/default fallback.
+const PLAYTOMIC_CATCHALL_TENANTS = new Set([
+  // Global / AU
+  '019d46ee-b610-4a12-8344-7e839e03b1a7',  // AU catch-all (190 venues)
+  '405a3ba5-7f95-429a-b56e-14353a3644d9',   // AU partial-match ("hi")
+  '2eb9fb08-3810-4359-81e5-057eff5f619f',   // AU partial-match ("ass")
+  'f513e906-c84e-454a-aee8-71a7ac43c3f8',   // AU partial-match ("f")
+  '0109adc4-8d51-437f-9dd0-c13f9fb5fd91',   // AU partial-match ("HV")
+  '637727e9-57b5-4485-8faa-ec57d2726382',   // AU partial-match ("Bounce")
+  // AE
+  '91474bfc-57ee-4c11-bda3-1bb091710f4d',   // AE catch-all (95 venues)
+  // ES
+  '0ce49dbf-e3e3-4edb-8507-52fa96374af6',   // ES catch-all (494 venues, 130 cities)
+  // IT
+  '6067a366-c543-45eb-8b8b-bdc7a7993d3a',   // IT catch-all (219 venues, 96 cities)
+  '01a12b00-e3c3-4dfd-a5f7-96895de801ad',   // IT catch-all (97 venues, tennis fallback)
+  'a543da48-cf21-49be-a3d4-d7595501990a',   // IT catch-all (38 venues)
+  // FR
+  '8296aacd-f97e-47a8-852d-e6253fc92b97',   // FR catch-all (46 venues)
+  'e9fe470e-c819-4f57-a9c1-3009e05de1bb',   // FR catch-all (46 venues)
+  // US
+  'dedf9203-31ee-4f21-99b4-9b54df20e4a0',   // US catch-all (36 venues)
+  '0f2f5dfe-907e-42d0-9b5b-ef460c052b90',   // US catch-all (14 venues)
+  // DE
+  'a4a73583-1ec9-48df-8f2b-a764c42c5826',   // DE catch-all (23 venues)
+  '473a9387-3c4d-4f0d-813a-9da45976e3b7',   // DE catch-all (17 venues)
+  '7f01aae5-8e69-42c4-9dcb-08ee801516ab',   // DE catch-all (16 venues)
+  // ID
+  '4ae8ff7b-251f-4d9f-990b-18d84bc67ee6',   // ID catch-all (16 venues)
+  // IT (smaller)
+  '31acfd90-e1bc-41b1-b80d-76fe3d7ee8a0',   // IT catch-all (14 venues)
+  '487aaf5d-5fa9-4320-a430-f910d0cdff31',   // IT catch-all (12 venues)
+  '29486a34-4647-48e3-98c8-4001497887a1',   // IT catch-all (10 venues)
+]);
+
+// Keywords that indicate a venue is NOT a padel venue
+const NON_PADEL_KEYWORDS = [
+  'bowling', 'tenpin', 'ten pin', 'bowls', 'lawn bowls',
+  'golf', 'golf club', 'golf course',
+  'pistol', 'gun club', 'rifle', 'shooting',
+  'canoe', 'kayak', 'outrigger', 'paddlers',
+  'bridge club', 'bridge association',
+  'rsl', 'ex-services', 'ex-service', 'leagues club',
+  'athletics', 'athletic club', 'little athletics',
+  'cycling', 'bmx', 'mountain bike',
+  'swimming', 'aquatic', 'waves',
+  'paintball', 'laser tag',
+  'intersport', 'rebel sport',
+  'mallet sports', 'croquet',
+  'equestrian', 'horse', 'pony club',
+  'sailing', 'yacht',
+  'rowing', 'dragon boat',
+];
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+/**
+ * Strip catch-all Playtomic tenant IDs — these match any search and aren't real venues.
+ * Returns null if the value contains a catch-all tenant ID, otherwise returns the original.
+ */
+function stripCatchallTenant(value) {
+  if (!value) return null;
+  for (const id of PLAYTOMIC_CATCHALL_TENANTS) {
+    if (value.includes(id)) return null;
+  }
+  return value;
+}
+
+/**
+ * Check if a venue name suggests it's NOT a padel venue.
+ * Returns { isNonPadel: true, reason } or { isNonPadel: false }.
+ */
+function checkNonPadelVenue(name, website) {
+  if (!name) return { isNonPadel: false };
+  const lower = name.toLowerCase();
+
+  // If the name contains "padel" anywhere, it's likely a padel venue — skip filter
+  if (/padel/i.test(lower)) return { isNonPadel: false };
+
+  // Check against non-padel keywords
+  for (const keyword of NON_PADEL_KEYWORDS) {
+    if (lower.includes(keyword)) {
+      return { isNonPadel: true, reason: `Non-padel venue (matched: "${keyword}")` };
+    }
+  }
+
+  return { isNonPadel: false };
+}
+
 // ─── Notion API Helpers ─────────────────────────────────────────────────────
 
 function notionHeaders() {
@@ -208,8 +299,8 @@ function extractVenue(page) {
     lng,
     website: getText(p['Website']) || null,
     phone: getText(p['Phone']) || null,
-    playtomicId: getText(p['Playtomic ID']) || null,
-    playtomicUrl: getText(p['Playtomic URL']) || null,
+    playtomicId: stripCatchallTenant(getText(p['Playtomic ID'])),
+    playtomicUrl: stripCatchallTenant(getText(p['Playtomic URL'])),
     googlePlaceId: getText(p['Google Place ID']) || null,
     googleRating: getNumber(p['Google Rating']),
     googleReviews: getNumber(p['Google Reviews']),
@@ -272,23 +363,53 @@ function detectInternalDuplicates(venues) {
     }
   }
 
-  // --- Group by coordinates (within 100m) + name similarity ---
+  // --- Group by coordinates (within 250m) + name similarity ---
+  // Two tiers: within 100m needs 50% name match, 100-250m needs 70% match
   const withCoords = venues.filter(v => v.lat && v.lng && !resultMap.get(v.pageId).isDuplicate);
   for (let i = 0; i < withCoords.length; i++) {
     if (resultMap.get(withCoords[i].pageId).isDuplicate) continue;
     for (let j = i + 1; j < withCoords.length; j++) {
       if (resultMap.get(withCoords[j].pageId).isDuplicate) continue;
       const dist = haversineMetres(withCoords[i].lat, withCoords[i].lng, withCoords[j].lat, withCoords[j].lng);
-      if (dist <= 100) {
+      if (dist <= 250) {
         const sim = stringSimilarity(withCoords[i].name, withCoords[j].name);
-        if (sim > 0.70) {
-          // Keep the one with more data
+        const threshold = dist <= 100 ? 0.50 : 0.70;
+        if (sim > threshold) {
           const keepIdx = fieldCount(withCoords[i]) >= fieldCount(withCoords[j]) ? i : j;
           const dropIdx = keepIdx === i ? j : i;
           const r = resultMap.get(withCoords[dropIdx].pageId);
           r.isDuplicate = true;
           r.duplicateOf = withCoords[keepIdx].pageId;
           r.reason = `Within ${Math.round(dist)}m, name similarity ${(sim * 100).toFixed(0)}%`;
+        }
+      }
+    }
+  }
+
+  // --- Fuzzy name clustering within same city ---
+  // Catches venues like "XPark Padel Dubai" vs "X Park Padel - Dubai Marina"
+  const byCity = new Map();
+  for (const v of venues) {
+    if (resultMap.get(v.pageId).isDuplicate) continue;
+    const city = (v.city || '').toLowerCase().trim();
+    if (!city) continue;
+    if (!byCity.has(city)) byCity.set(city, []);
+    byCity.get(city).push(v);
+  }
+  for (const [, cityVenues] of byCity) {
+    if (cityVenues.length < 2) continue;
+    for (let i = 0; i < cityVenues.length; i++) {
+      if (resultMap.get(cityVenues[i].pageId).isDuplicate) continue;
+      for (let j = i + 1; j < cityVenues.length; j++) {
+        if (resultMap.get(cityVenues[j].pageId).isDuplicate) continue;
+        const sim = stringSimilarity(cityVenues[i].name, cityVenues[j].name);
+        if (sim > 0.80) {
+          const keepIdx = fieldCount(cityVenues[i]) >= fieldCount(cityVenues[j]) ? i : j;
+          const dropIdx = keepIdx === i ? j : i;
+          const r = resultMap.get(cityVenues[dropIdx].pageId);
+          r.isDuplicate = true;
+          r.duplicateOf = cityVenues[keepIdx].pageId;
+          r.reason = `Same city, name similarity ${(sim * 100).toFixed(0)}%`;
         }
       }
     }
@@ -372,6 +493,8 @@ async function detectWPDuplicates(venues) {
 function cleanNames(venues) {
   const SOURCE_SUFFIXES = [' - Playtomic', ' - Matchi', ' - Google'];
   const JUNK_NAMES = ['padel', 'club', 'sports', 'sport', 'tennis', 'center', 'centre'];
+  // Playtomic sandbox/test tenants — always exclude
+  const BLOCKLIST_PATTERNS = [/anemone/i, /test\s*tenant/i, /demo\s*club/i, /sandbox/i];
 
   return venues.map(v => {
     let cleaned = v.name || '';
@@ -393,7 +516,11 @@ function cleanNames(venues) {
     let isJunk = false;
     let reason = null;
 
-    if (cleaned.length < 4) {
+    // Check blocklist first (ANEMONE sandboxes, test tenants, etc.)
+    if (BLOCKLIST_PATTERNS.some(p => p.test(cleaned))) {
+      isJunk = true;
+      reason = `Blocklisted pattern: "${cleaned}"`;
+    } else if (cleaned.length < 4) {
       isJunk = true;
       reason = `Name too short: "${cleaned}"`;
     } else {
@@ -401,6 +528,15 @@ function cleanNames(venues) {
       if (words.length > 0 && words.every(w => JUNK_NAMES.includes(w))) {
         isJunk = true;
         reason = `Generic name only: "${cleaned}"`;
+      }
+    }
+
+    // Non-padel venue filter — bowling alleys, golf clubs, pistol clubs, etc.
+    if (!isJunk) {
+      const nonPadel = checkNonPadelVenue(cleaned, v.website);
+      if (nonPadel.isNonPadel) {
+        isJunk = true;
+        reason = nonPadel.reason;
       }
     }
 
@@ -521,6 +657,63 @@ async function checkGooglePlaces(venues) {
     // Rate limit + progress
     if (i > 0 && i % 10 === 0) console.log(`  [qualify]   ...checked ${i}/${venues.length} Google Places`);
     await sleep(200);
+  }
+
+  return results;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LAYER 5b: Google Place ID Deduplication
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * After Google Places lookup, group venues by Place ID.
+ * Multiple Notion entries with the same Google Place ID = same real venue.
+ * Keeps the one with the most data, marks others as duplicates.
+ */
+function deduplicateByPlaceId(venues, layer5Results) {
+  const placeMap = new Map(); // placeId → [{ venue, layer5Result }]
+
+  for (const v of venues) {
+    const l5 = layer5Results.find(r => r.pageId === v.pageId);
+    if (!l5 || !l5.placeId) continue;
+    if (!placeMap.has(l5.placeId)) placeMap.set(l5.placeId, []);
+    placeMap.get(l5.placeId).push({ venue: v, l5 });
+  }
+
+  const results = venues.map(v => ({
+    pageId: v.pageId,
+    isDuplicate: false,
+    duplicateOf: null,
+    reason: null,
+  }));
+  const resultMap = new Map(results.map(r => [r.pageId, r]));
+
+  const fieldCount = (v) => {
+    let count = 0;
+    if (v.name) count++;
+    if (v.address) count++;
+    if (v.city) count++;
+    if (v.website) count++;
+    if (v.phone) count++;
+    if (v.lat && v.lng) count++;
+    if (v.playtomicId) count++;
+    if (v.courts) count++;
+    if (v.photos) count++;
+    return count;
+  };
+
+  for (const [placeId, group] of placeMap) {
+    if (group.length < 2) continue;
+    // Keep the one with most data
+    group.sort((a, b) => fieldCount(b.venue) - fieldCount(a.venue));
+    const keeper = group[0];
+    for (let i = 1; i < group.length; i++) {
+      const r = resultMap.get(group[i].venue.pageId);
+      r.isDuplicate = true;
+      r.duplicateOf = keeper.venue.pageId;
+      r.reason = `Same Google Place ID: ${placeId}`;
+    }
   }
 
   return results;
@@ -841,7 +1034,7 @@ async function updateNotionQualification(pageId, qualification) {
   if (qualification.cityEnglish) props['City'] = { rich_text: [{ type: 'text', text: { content: qualification.cityEnglish } }] };
   if (qualification.brand) props['Brand'] = { rich_text: [{ type: 'text', text: { content: qualification.brand } }] };
   if (qualification.surfaces) props['Surface'] = { rich_text: [{ type: 'text', text: { content: qualification.surfaces } }] };
-  if (qualification.indoorOutdoor) props['Indoor/Outdoor'] = { rich_text: [{ type: 'text', text: { content: qualification.indoorOutdoor } }] };
+  if (qualification.indoorOutdoor) props['Indoor/Outdoor'] = { select: { name: qualification.indoorOutdoor } };
 
   // Try to update — catch property-not-found errors gracefully
   try {
@@ -891,7 +1084,7 @@ async function updateNotionQualification(pageId, qualification) {
  * Determines final status: ready, excluded, or needs-review.
  */
 function buildQualification(venue, layerResults) {
-  const { layer1, layer2, layer3, layer4, layer5, layer6, layer7, layer8, layer9, layer10 } = layerResults;
+  const { layer1, layer2, layer3, layer4, layer5, layer5b, layer6, layer7, layer8, layer9, layer10 } = layerResults;
 
   const find = (arr, pageId) => (arr || []).find(r => r.pageId === pageId) || {};
 
@@ -900,6 +1093,7 @@ function buildQualification(venue, layerResults) {
   const l3 = find(layer3, venue.pageId);
   const l4 = find(layer4, venue.pageId);
   const l5 = find(layer5, venue.pageId);
+  const l5b = find(layer5b, venue.pageId);
   const l6 = find(layer6, venue.pageId);
   const l7 = find(layer7, venue.pageId);
   const l8 = find(layer8, venue.pageId);
@@ -932,6 +1126,14 @@ function buildQualification(venue, layerResults) {
     return qual;
   }
 
+  // Place ID duplicate (different entries, same real venue)
+  if (l5b && l5b.isDuplicate) {
+    qual.status = 'excluded';
+    qual.exclusionReason = `Place ID duplicate: ${l5b.reason}`;
+    qual.exclusionType = 'duplicate';
+    return qual;
+  }
+
   // WP duplicate (already published)
   if (l2.isDuplicate) {
     qual.status = 'excluded';
@@ -940,11 +1142,11 @@ function buildQualification(venue, layerResults) {
     return qual;
   }
 
-  // Junk name
+  // Junk name or non-padel venue
   if (l3.isJunk) {
     qual.status = 'excluded';
     qual.exclusionReason = `Junk name: ${l3.reason}`;
-    qual.exclusionType = 'junk-name';
+    qual.exclusionType = l3.reason && l3.reason.startsWith('Non-padel') ? 'non-padel' : 'junk-name';
     return qual;
   }
 
@@ -1047,8 +1249,9 @@ async function qualifyCountry(countryCode, options = {}) {
   console.log(`[qualify] Layer 3: Name cleaning...`);
   layerResults.layer3 = cleanNames(venues);
   const fixedNames = layerResults.layer3.filter(r => r.originalName !== r.cleanedName).length;
-  const junkNames = layerResults.layer3.filter(r => r.isJunk).length;
-  console.log(`[qualify]   Fixed ${fixedNames} names, excluded ${junkNames} junk entries`);
+  const junkNames = layerResults.layer3.filter(r => r.isJunk && (!r.reason || !r.reason.startsWith('Non-padel'))).length;
+  const nonPadelNames = layerResults.layer3.filter(r => r.isJunk && r.reason && r.reason.startsWith('Non-padel')).length;
+  console.log(`[qualify]   Fixed ${fixedNames} names, excluded ${junkNames} junk + ${nonPadelNames} non-padel entries`);
 
   // ── Layer 4: Playtomic verification (API calls) ──
   if (skipPlaytomic) {
@@ -1093,6 +1296,22 @@ async function qualifyCountry(countryCode, options = {}) {
   const avgReviews = layerResults.layer5.filter(r => r.reviewCount).reduce((s, r) => s + r.reviewCount, 0) /
                      (layerResults.layer5.filter(r => r.reviewCount).length || 1);
   console.log(`[qualify]   Found places for ${gpFound} venues — avg rating ${avgRating.toFixed(1)}, avg reviews ${Math.round(avgReviews)}`);
+
+  // ── Layer 5b: Place ID dedup (bulk, no API) ──
+  console.log(`[qualify] Layer 5b: Google Place ID deduplication...`);
+  layerResults.layer5b = deduplicateByPlaceId(nonDupVenues, layerResults.layer5);
+  const placeIdDups = layerResults.layer5b.filter(r => r.isDuplicate).length;
+  console.log(`[qualify]   ${placeIdDups} venues share a Place ID with another entry`);
+  // Add Place ID dupes to the dupIds set so subsequent layers skip them
+  for (const r of layerResults.layer5b) {
+    if (r.isDuplicate) dupIds.add(r.pageId);
+  }
+  // Also add empty entries for already-excluded dupes
+  for (const v of venues) {
+    if (!layerResults.layer5b.find(r => r.pageId === v.pageId)) {
+      layerResults.layer5b.push({ pageId: v.pageId, isDuplicate: false, duplicateOf: null, reason: null });
+    }
+  }
 
   // ── Layer 6: Website check (API calls, slowest) ──
   if (skipWebsite) {
@@ -1148,7 +1367,7 @@ async function qualifyCountry(countryCode, options = {}) {
   console.log(`[qualify] Building qualifications and ${dryRun ? 'previewing' : 'updating Notion'}...`);
 
   const summary = { total: venues.length, ready: 0, excluded: 0, needsReview: 0, duplicates: 0, errors: 0 };
-  const exclusionBreakdown = { duplicates: 0, alreadyLive: 0, junkNames: 0, inactive: 0, equipmentShop: 0, unverifiable: 0 };
+  const exclusionBreakdown = { duplicates: 0, alreadyLive: 0, junkNames: 0, nonPadel: 0, inactive: 0, equipmentShop: 0, unverifiable: 0 };
 
   for (let i = 0; i < venues.length; i++) {
     const v = venues[i];
@@ -1161,6 +1380,7 @@ async function qualifyCountry(countryCode, options = {}) {
         if (qual.exclusionType === 'duplicate') exclusionBreakdown.duplicates++;
         else if (qual.exclusionType === 'already-live') exclusionBreakdown.alreadyLive++;
         else if (qual.exclusionType === 'junk-name') exclusionBreakdown.junkNames++;
+        else if (qual.exclusionType === 'non-padel') exclusionBreakdown.nonPadel++;
         else if (qual.exclusionType === 'inactive') exclusionBreakdown.inactive++;
         else if (qual.exclusionType === 'equipment-shop') exclusionBreakdown.equipmentShop++;
         else if (qual.exclusionType === 'unverifiable') exclusionBreakdown.unverifiable++;
@@ -1199,6 +1419,7 @@ async function qualifyCountry(countryCode, options = {}) {
   console.log(`[qualify]     - Duplicates:    ${exclusionBreakdown.duplicates}`);
   console.log(`[qualify]     - Already live:  ${exclusionBreakdown.alreadyLive}`);
   console.log(`[qualify]     - Junk names:    ${exclusionBreakdown.junkNames}`);
+  console.log(`[qualify]     - Non-padel:     ${exclusionBreakdown.nonPadel}`);
   console.log(`[qualify]     - Inactive:      ${exclusionBreakdown.inactive}`);
   console.log(`[qualify]     - Equip shops:   ${exclusionBreakdown.equipmentShop}`);
   console.log(`[qualify]     - Unverifiable:  ${exclusionBreakdown.unverifiable}`);
@@ -1239,6 +1460,9 @@ async function qualifySingle(notionPageId) {
 
   console.log(`[qualify] Layer 5: Google Places verification...`);
   layerResults.layer5 = await checkGooglePlaces(venues);
+
+  console.log(`[qualify] Layer 5b: Place ID dedup...`);
+  layerResults.layer5b = deduplicateByPlaceId(venues, layerResults.layer5);
 
   console.log(`[qualify] Layer 6: Website check...`);
   layerResults.layer6 = await checkWebsites(venues);
@@ -1317,6 +1541,7 @@ module.exports = {
   cleanNames,
   checkPlaytomic,
   checkGooglePlaces,
+  deduplicateByPlaceId,
   checkWebsites,
   validateGeography,
   scoreCompleteness,

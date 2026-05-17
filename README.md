@@ -34,5 +34,5 @@ node qualify-queue.js AE --skip-website  # skip website checks (faster)
 ## Requirements
 
 - Node.js v24+
-- Part of the padeli-notion pipeline — requires the full `lib/` module set
+- Standalone — all required modules bundled in this repo
 - Environment variables: `NOTION_API_KEY`, `GOOGLE_PLACES_API_KEY`, `PADELI_WP_USER`, `PADELI_WP_APP_PASSWORD`

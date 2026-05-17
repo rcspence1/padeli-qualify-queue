@@ -62,7 +62,7 @@ Extract country code and options from user's message.
 
 ```bash
 node -e "
-const { qualifyCountry } = require(process.env.PADELI_PROJECT_DIR + '/lib/qualify-queue');
+const { qualifyCountry } = require('./qualify-queue');
 qualifyCountry('{CC}', { dryRun: false, limit: null }).then(r => console.log(JSON.stringify(r, null, 2)));
 "
 ```
@@ -70,7 +70,7 @@ qualifyCountry('{CC}', { dryRun: false, limit: null }).then(r => console.log(JSO
 For dry run:
 ```bash
 node -e "
-const { qualifyCountry } = require(process.env.PADELI_PROJECT_DIR + '/lib/qualify-queue');
+const { qualifyCountry } = require('./qualify-queue');
 qualifyCountry('{CC}', { dryRun: true }).then(r => console.log(JSON.stringify(r, null, 2)));
 "
 ```
@@ -78,19 +78,19 @@ qualifyCountry('{CC}', { dryRun: true }).then(r => console.log(JSON.stringify(r,
 For single venue:
 ```bash
 node -e "
-const { qualifySingle } = require(process.env.PADELI_PROJECT_DIR + '/lib/qualify-queue');
+const { qualifySingle } = require('./qualify-queue');
 qualifySingle('{NOTION_PAGE_ID}').then(r => console.log(JSON.stringify(r, null, 2)));
 "
 ```
 
 Or via CLI:
 ```bash
-cd ~/Projects/padeli-notion
-node lib/qualify-queue.js AE
-node lib/qualify-queue.js AE --dry-run
-node lib/qualify-queue.js AE --limit 50
-node lib/qualify-queue.js AE --skip-website
-node lib/qualify-queue.js single <notion-page-id>
+cd ~/Projects/padeli-qualify-queue
+node qualify-queue.js AE
+node qualify-queue.js AE --dry-run
+node qualify-queue.js AE --limit 50
+node qualify-queue.js AE --skip-website
+node qualify-queue.js single <notion-page-id>
 ```
 
 ### Step 3: Review Results
@@ -155,20 +155,21 @@ After qualification, each venue's Notion row is enriched with:
 
 ## Dependencies
 
-- Node.js v24+ (native fetch, no npm packages)
-- Modules at `$PADELI_PROJECT_DIR/lib/`:
+- Node.js v24+ (native fetch, no npm packages, zero external deps)
+- All modules bundled at repo root:
   - `qualify-queue.js` — this skill's engine
   - `discover-clubs.js` — Playtomic tenant fetcher
   - `place-id-backfill.js` — Google Places lookup
   - `shell-creator.js` — name matching + WP duplicate search
   - `site-renderer.js` — headless Chrome for JS-rendered websites
+  - `master-sheet.js` — Notion production queue
   - `notion-sync.js` — Notion API patterns
-  - `wp-client.js` — WP REST API client
-- Env vars:
-  - `PADELI_PROJECT_DIR` — path to repo
+  - `wp-client.js`, `config.js`, `utils.js` — shared helpers
+- Env vars (in `~/.zshrc`):
   - `NOTION_API_KEY` — Notion integration key
   - `GOOGLE_PLACES_API_KEY` — Google Places API key
   - `PADELI_WP_USER` / `PADELI_WP_APP_PASSWORD` — WP auth (for duplicate check)
+  - `PADELI_OPERATOR` — operator name for Notion claim locking
 
 ---
 
