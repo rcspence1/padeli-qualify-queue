@@ -14,7 +14,7 @@ Sweeps all "Discovered" venues in the Notion Club Tracker and sorts them into:
 1. **Internal dedup** — same Playtomic ID, coordinates within 100m, same website
 2. **WP dedup** — already published or drafted on padeli.com
 3. **Name cleaning** — junk names, source suffixes, formatting
-4. **Playtomic check** — tenant active? Courts bookable? Surface types?
+4. **Playtomic check** — reads the public club page (`playtomic-data.js`; `api.playtomic.io` is gone). Active = page 200 AND > 0 padel courts. Court/venue gate: tennis / multi-sport clubs need 2+ padel courts — 1 Playtomic court → Excluded `tennis-club-1-court` (Hold Reason), unknown count → Needs Review
 5. **Google Places** — real venue? Rating? Reviews? Sports type?
 6. **Website check** — site live? Padel content? Equipment shop?
 7. **Geography** — coordinates in correct country? City name normalisation
@@ -29,7 +29,10 @@ node qualify-queue.js AE              # qualify all Discovered in AE
 node qualify-queue.js AE --dry-run    # preview without updating Notion
 node qualify-queue.js AE --limit 10   # only process 10
 node qualify-queue.js AE --skip-website  # skip website checks (faster)
+node qualify-queue.js AE --report out.json  # per-venue decisions (works with --dry-run)
 ```
+
+Notion writes are spaced ≥ 340 ms (≤ 3/s). Qualify reasons are prepended to Notes (`[qualify YYYY-MM-DD] …`); prior notes are kept.
 
 ## Requirements
 

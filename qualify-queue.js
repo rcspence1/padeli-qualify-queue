@@ -31,7 +31,17 @@
  *   node lib/qualify-queue.js single <notion-page-id>
  *
  * Node.js v24+ — zero external dependencies. CommonJS.
+ *
+ * 2026-10-02 (playtomic-port): api.playtomic.io is NXDOMAIN, so Layer 4 now reads
+ * the public club page via playtomic-data.js (through discover-clubs.fetchPlaytomicTenant).
+ * The page carries no status field: a tenant is ACTIVE when the slug page is 200 AND
+ * it lists > 0 padel courts. Court/venue gate (Ryan's rule): tennis / multi-sport clubs
+ * are listed only with 2+ padel courts — Playtomic-verified 1 court → Excluded
+ * "tennis-club-1-court" (Hold Reason), unknown court count → Needs Review.
  */
+
+// playtomic-data.js reads its politeness delay from env at load; default to 1s for the sweep.
+if (!process.env.PADELI_PLAYTOMIC_DELAY_MS) process.env.PADELI_PLAYTOMIC_DELAY_MS = '1000';
 
 const { stringSimilarity, searchListings } = require('./shell-creator');
 const { fetchPlaytomicTenant } = require('./discover-clubs');
@@ -133,6 +143,37 @@ function checkNonPadelVenue(name, website) {
   }
 
   return { isNonPadel: false };
+}
+
+// ─── Venue class (court/venue gate) ─────────────────────────────────────────
+// Same signals as padeli-notion/tools/uk-discovery-push.js classifyVenue(); the push
+// writes "venue_class=<cls>" into Notes, which wins when present.
+
+const VC_PADEL_RE = /p[aá]del/i;
+const VC_TENNIS_RE = /\btennis\b|\bltc\b|\bracquets?\b|\brackets?\b/i;
+const VC_MULTI_STRONG_RE = /\b(david lloyd|virgin active|nuffield|bannatyne|everyone active|better\b|total fitness|puregym|pure gym|powerleague|goals\b|leisure (centre|center)|sports? (centre|center|complex|village)|golf|cricket|rugby|football|hockey|ymca|school|academy|university|college|hotel|resort|country club|health club|lido)\b/i;
+const VC_MULTI_BROAD_RE = /\b(leisure|sports? (ground|hub|park)|gym|fitness|stadium|park|social club|community (centre|center|club)|recreation|athletic|squash|bowls|spa)\b/i;
+
+/**
+ * Classify a venue as padel-first | tennis-club-with-padel | multi-sport | unknown.
+ * @param {object} venue - extractVenue() row (name, notes)
+ * @param {object} [l4] - Layer 4 entry (otherSports from the Playtomic tenant)
+ */
+function classifyVenueClass(venue, l4) {
+  const m = (venue.notes || '').match(/venue_class=(padel-first|tennis-club-with-padel|multi-sport|unknown)/);
+  if (m && m[1] !== 'unknown') return { venueClass: m[1], source: 'notes' };
+  const n = venue.name || '';
+  let cls = 'unknown';
+  if (VC_PADEL_RE.test(n) && VC_MULTI_STRONG_RE.test(n)) cls = 'multi-sport';
+  else if (VC_PADEL_RE.test(n) && VC_TENNIS_RE.test(n)) cls = 'tennis-club-with-padel';
+  else if (VC_PADEL_RE.test(n)) cls = 'padel-first';
+  else if (VC_TENNIS_RE.test(n)) cls = 'tennis-club-with-padel';
+  else if (VC_MULTI_STRONG_RE.test(n) || VC_MULTI_BROAD_RE.test(n)) cls = 'multi-sport';
+  const others = (l4 && l4.otherSports) || [];
+  if (cls === 'unknown' && others.length) cls = others.includes('TENNIS') ? 'tennis-club-with-padel' : 'multi-sport';
+  else if (cls === 'padel-first' && others.includes('TENNIS')) cls = 'tennis-club-with-padel';
+  if (cls === 'unknown' && m) cls = m[1];
+  return { venueClass: cls, source: cls === 'unknown' ? null : 'name/tenant' };
 }
 
 // ─── Notion API Helpers ─────────────────────────────────────────────────────
@@ -277,6 +318,8 @@ function extractVenue(page) {
     return prop.select.name;
   };
 
+  const getAllText = (prop) => (prop && prop.type === 'rich_text' ? (prop.rich_text || []).map(t => t.plain_text).join('') : '');
+
   // Parse coordinates from "lat, lng" string
   const coordsRaw = getText(p['Coordinates']);
   let lat = null, lng = null;
@@ -307,6 +350,8 @@ function extractVenue(page) {
     courts: getNumber(p['Courts']),
     source: getSelect(p['Source']) || getText(p['Source']) || '',
     photos: getNumber(p['Photos']) || 0,
+    notes: getAllText(p['Notes']),
+    holdReason: ((p['Hold Reason'] && p['Hold Reason'].multi_select) || []).map(o => o.name),
   };
 }
 
@@ -549,64 +594,61 @@ function cleanNames(venues) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Verify each venue's Playtomic data by calling the Playtomic API.
- * Extracts court count, surfaces, indoor/outdoor, images, booking type.
+ * Verify each venue's Playtomic data from the public club page (playtomic-data.js via
+ * discover-clubs.fetchPlaytomicTenant — accepts a tenant UUID, a slug or any Playtomic URL).
+ * Extracts court count, indoor/outdoor, images, booking type, other sports.
+ *
+ * Liveness: the club page has no tenant_status field, so a tenant is ACTIVE when the
+ * page resolved (200) AND it lists > 0 padel courts. `pageOk` records that the page
+ * resolved at all (unreachable ≠ 0 courts).
  */
+const emptyPlaytomicEntry = (pageId) => ({
+  pageId, playtomicActive: false, pageOk: false, verifiedCourts: null, surfaces: null,
+  indoorOutdoor: null, images: 0, bookingType: null, otherSports: [], tenantName: null, enrichment: null,
+});
+
 async function checkPlaytomic(venues) {
   const results = [];
-  const toCheck = venues.filter(v => v.playtomicId);
+  const toCheck = venues.filter(v => v.playtomicId || v.playtomicUrl);
 
   for (let i = 0; i < toCheck.length; i++) {
     const v = toCheck[i];
-    const entry = {
-      pageId: v.pageId,
-      playtomicActive: false,
-      verifiedCourts: null,
-      surfaces: null,
-      indoorOutdoor: null,
-      images: 0,
-      bookingType: null,
-      enrichment: null,
-    };
+    const entry = emptyPlaytomicEntry(v.pageId);
+    const ref = v.playtomicId || v.playtomicUrl;
 
     try {
-      const tenant = await fetchPlaytomicTenant(v.playtomicId);
+      const tenant = await fetchPlaytomicTenant(ref);
       if (tenant) {
-        const isActive = tenant.playtomic_status === 'ACTIVE' || tenant.playtomic_status === 'PUBLISHED';
+        const courts = tenant.courts || 0;
+        const isActive = tenant.playtomic_status
+          ? /^(ACTIVE|PUBLISHED)$/.test(tenant.playtomic_status)
+          : courts > 0;
+        entry.pageOk = true;
         entry.playtomicActive = isActive;
-        entry.verifiedCourts = tenant.courts || null;
+        entry.verifiedCourts = courts || null;
         entry.surfaces = tenant.surface_type || null;
         entry.indoorOutdoor = tenant.indoor_outdoor || null;
         entry.images = (tenant.images || []).length;
         entry.bookingType = tenant.booking_type || null;
+        entry.otherSports = tenant.other_sports || [];
+        entry.tenantName = tenant.tenant_name || null;
         entry.enrichment = tenant;
       }
     } catch (err) {
-      console.log(`  [qualify] Playtomic check failed for ${v.playtomicId}: ${err.message}`);
+      console.log(`  [qualify] Playtomic check failed for ${ref}: ${err.message}`);
     }
 
     results.push(entry);
 
-    // Rate limit + progress
+    // Progress (playtomic-data.js already spaces requests by PADELI_PLAYTOMIC_DELAY_MS)
     if (i > 0 && i % 10 === 0) console.log(`  [qualify]   ...checked ${i}/${toCheck.length} Playtomic tenants`);
-    await sleep(500);
+    await sleep(100);
   }
 
-  // Add empty entries for venues without Playtomic IDs
+  // Add empty entries for venues without a Playtomic reference
   const checkedIds = new Set(toCheck.map(v => v.pageId));
   for (const v of venues) {
-    if (!checkedIds.has(v.pageId)) {
-      results.push({
-        pageId: v.pageId,
-        playtomicActive: false,
-        verifiedCourts: null,
-        surfaces: null,
-        indoorOutdoor: null,
-        images: 0,
-        bookingType: null,
-        enrichment: null,
-      });
-    }
+    if (!checkedIds.has(v.pageId)) results.push(emptyPlaytomicEntry(v.pageId));
   }
 
   return results;
@@ -1030,7 +1072,13 @@ async function updateNotionQualification(pageId, qualification) {
   if (qualification.verifiedCourts) props['Courts'] = { number: qualification.verifiedCourts };
   if (qualification.qualScore !== undefined) props['Qualification Score'] = { number: qualification.qualScore };
   if (qualification.priorityScore !== undefined) props['Priority Score'] = { number: qualification.priorityScore };
-  if (qualification.exclusionReason) props['Notes'] = { rich_text: [{ type: 'text', text: { content: qualification.exclusionReason } }] };
+  // Notes: prepend the qualify reason, keep what was there (discovery provenance, venue_class, hints)
+  if (qualification.exclusionReason) {
+    const stamp = `[qualify ${new Date().toISOString().slice(0, 10)}] ${qualification.exclusionReason}`;
+    const prior = (qualification.priorNotes || '').trim();
+    props['Notes'] = { rich_text: [{ type: 'text', text: { content: (prior ? `${stamp}\n${prior}` : stamp).slice(0, 2000) } }] };
+  }
+  if (qualification.holdReason) props['Hold Reason'] = { multi_select: [{ name: qualification.holdReason }] };
   if (qualification.cityEnglish) props['City'] = { rich_text: [{ type: 'text', text: { content: qualification.cityEnglish } }] };
   if (qualification.brand) props['Brand'] = { rich_text: [{ type: 'text', text: { content: qualification.brand } }] };
   if (qualification.surfaces) props['Surface'] = { rich_text: [{ type: 'text', text: { content: qualification.surfaces } }] };
@@ -1048,7 +1096,7 @@ async function updateNotionQualification(pageId, qualification) {
       // Retry with only Status (which always exists)
       const safeProps = { Status: props.Status };
       // Add fields one-by-one that are likely to exist
-      const likelyFields = ['Google Rating', 'Google Reviews', 'Google Place ID', 'Courts', 'City', 'Notes'];
+      const likelyFields = ['Google Rating', 'Google Reviews', 'Google Place ID', 'Courts', 'City', 'Notes', 'Hold Reason'];
       for (const field of likelyFields) {
         if (props[field]) safeProps[field] = props[field];
       }
@@ -1100,10 +1148,18 @@ function buildQualification(venue, layerResults) {
   const l9 = find(layer9, venue.pageId);
   const l10 = find(layer10, venue.pageId);
 
+  const { venueClass } = classifyVenueClass(venue, l4);
+  const isTennisOrMulti = venueClass === 'tennis-club-with-padel' || venueClass === 'multi-sport';
+  // Playtomic-verified padel courts (page resolved) — authoritative for the court gate
+  const ptCourts = l4.pageOk ? (l4.verifiedCourts || 0) : null;
+
   const qual = {
     status: 'ready',
     exclusionReason: null,
     exclusionType: null,
+    holdReason: null,
+    venueClass,
+    priorNotes: venue.notes || '',
     googleRating: l5.rating || null,
     googleReviews: l5.reviewCount || null,
     placeId: l5.placeId || null,
@@ -1142,8 +1198,11 @@ function buildQualification(venue, layerResults) {
     return qual;
   }
 
-  // Junk name or non-padel venue
-  if (l3.isJunk) {
+  // Junk name or non-padel venue. A "non-padel" keyword (golf, bowls, ...) is overridden
+  // when Playtomic proves padel courts exist — the host is then a multi-sport venue and
+  // Ryan's 2+ court rule below decides.
+  const nonPadelOverridden = l3.isJunk && l3.reason && l3.reason.startsWith('Non-padel') && ptCourts > 0;
+  if (l3.isJunk && !nonPadelOverridden) {
     qual.status = 'excluded';
     qual.exclusionReason = `Junk name: ${l3.reason}`;
     qual.exclusionType = l3.reason && l3.reason.startsWith('Non-padel') ? 'non-padel' : 'junk-name';
@@ -1151,10 +1210,21 @@ function buildQualification(venue, layerResults) {
   }
 
   // Playtomic inactive (only exclude if Playtomic is the sole source)
-  if (venue.playtomicId && !l4.playtomicActive && venue.source && !venue.source.includes('+')) {
+  if ((venue.playtomicId || venue.playtomicUrl) && !l4.playtomicActive && venue.source && !venue.source.includes('+')) {
     qual.status = 'excluded';
-    qual.exclusionReason = `Playtomic tenant inactive (sole source)`;
+    qual.exclusionReason = l4.pageOk
+      ? `Playtomic tenant inactive (sole source): club page lists 0 padel courts`
+      : `Playtomic tenant inactive (sole source): club page unreachable (${venue.playtomicUrl || venue.playtomicId})`;
     qual.exclusionType = 'inactive';
+    return qual;
+  }
+
+  // Court/venue gate — tennis / multi-sport clubs are listed only with 2+ padel courts
+  if (isTennisOrMulti && ptCourts === 1) {
+    qual.status = 'excluded';
+    qual.exclusionReason = `tennis-club-1-court: ${venueClass} with 1 padel court on Playtomic${l4.tenantName ? ` (${l4.tenantName})` : ''}`;
+    qual.exclusionType = 'tennis-club-1-court';
+    qual.holdReason = 'tennis-club-1-court';
     return qual;
   }
 
@@ -1163,6 +1233,17 @@ function buildQualification(venue, layerResults) {
     qual.status = 'excluded';
     qual.exclusionReason = `Website is an equipment shop, not a venue`;
     qual.exclusionType = 'equipment-shop';
+    return qual;
+  }
+
+  // Court/venue gate — unknown court count for a tennis / multi-sport club stays Needs Review
+  if (isTennisOrMulti && (ptCourts === null || ptCourts === 0)) {
+    const hint = (venue.notes || '').match(/website_hint=(\d+) court/);
+    qual.status = 'needs-review';
+    qual.exclusionReason = `tennis-club-court-count-unknown: ${venueClass} without a Playtomic-verified padel court count` +
+      (venue.courts ? ` (Notion Courts=${venue.courts}, unverified)` : '') + (hint ? ` (website hint ${hint[1]}, unverified)` : '') +
+      ` — confirm ≥2 padel courts before Ready`;
+    qual.exclusionType = 'court-count-unknown';
     return qual;
   }
 
@@ -1200,7 +1281,8 @@ function buildQualification(venue, layerResults) {
  * @returns {object} Summary: { total, ready, excluded, needsReview, duplicates, errors }
  */
 async function qualifyCountry(countryCode, options = {}) {
-  const { dryRun = false, limit = null, skipWebsite = false, skipPlaytomic = false } = options;
+  const { dryRun = false, limit = null, skipWebsite = false, skipPlaytomic = false, reportFile = null } = options;
+  const NOTION_WRITE_GAP_MS = 340; // ≤ 3 writes/s
 
   console.log(`[qualify] Starting qualification for ${countryCode.toUpperCase()}...`);
   if (dryRun) console.log(`[qualify] DRY RUN — no Notion updates will be made`);
@@ -1367,12 +1449,26 @@ async function qualifyCountry(countryCode, options = {}) {
   console.log(`[qualify] Building qualifications and ${dryRun ? 'previewing' : 'updating Notion'}...`);
 
   const summary = { total: venues.length, ready: 0, excluded: 0, needsReview: 0, duplicates: 0, errors: 0 };
-  const exclusionBreakdown = { duplicates: 0, alreadyLive: 0, junkNames: 0, nonPadel: 0, inactive: 0, equipmentShop: 0, unverifiable: 0 };
+  const exclusionBreakdown = { duplicates: 0, alreadyLive: 0, junkNames: 0, nonPadel: 0, inactive: 0, oneCourtRule: 0, equipmentShop: 0, unverifiable: 0, courtCountUnknown: 0 };
+  const report = [];
 
   for (let i = 0; i < venues.length; i++) {
     const v = venues[i];
     try {
       const qual = buildQualification(v, layerResults);
+      const l4 = (layerResults.layer4 || []).find(r => r.pageId === v.pageId) || {};
+      const l5 = (layerResults.layer5 || []).find(r => r.pageId === v.pageId) || {};
+      report.push({
+        pageId: v.pageId, name: v.name, source: v.source, status: qual.status, reason: qual.exclusionReason, type: qual.exclusionType,
+        venueClass: qual.venueClass, holdReason: qual.holdReason, notionCourts: v.courts,
+        playtomic: { ref: v.playtomicId || v.playtomicUrl || null, pageOk: !!l4.pageOk, active: !!l4.playtomicActive, courts: l4.verifiedCourts || null, tenantName: l4.tenantName || null, otherSports: l4.otherSports || [] },
+        google: { found: !!l5.hasGooglePlace, placeId: l5.placeId || null, rating: l5.rating || null, reviews: l5.reviewCount || null },
+        qualScore: qual.qualScore, priorityScore: qual.priorityScore,
+      });
+      if (dryRun) {
+        const tag = qual.status === 'ready' ? 'READY ' : qual.status === 'excluded' ? 'EXCL  ' : 'REVIEW';
+        console.log(`  ${tag} | ${v.name} | ${qual.venueClass} | pt=${l4.pageOk ? (l4.verifiedCourts || 0) + 'c' : '-'} gp=${l5.hasGooglePlace ? 'y' : 'n'} | ${qual.exclusionReason || `score ${qual.qualScore}/10 prio ${qual.priorityScore}`}`);
+      }
 
       if (qual.status === 'ready') summary.ready++;
       else if (qual.status === 'excluded') {
@@ -1382,16 +1478,18 @@ async function qualifyCountry(countryCode, options = {}) {
         else if (qual.exclusionType === 'junk-name') exclusionBreakdown.junkNames++;
         else if (qual.exclusionType === 'non-padel') exclusionBreakdown.nonPadel++;
         else if (qual.exclusionType === 'inactive') exclusionBreakdown.inactive++;
+        else if (qual.exclusionType === 'tennis-club-1-court') exclusionBreakdown.oneCourtRule++;
         else if (qual.exclusionType === 'equipment-shop') exclusionBreakdown.equipmentShop++;
         else if (qual.exclusionType === 'unverifiable') exclusionBreakdown.unverifiable++;
       } else {
         summary.needsReview++;
         if (qual.exclusionType === 'unverifiable') exclusionBreakdown.unverifiable++;
+        else if (qual.exclusionType === 'court-count-unknown') exclusionBreakdown.courtCountUnknown++;
       }
 
       if (!dryRun) {
         await updateNotionQualification(v.pageId, qual);
-        await sleep(150); // Notion rate limiting
+        await sleep(NOTION_WRITE_GAP_MS); // Notion rate limiting (≤ 3 writes/s)
       }
     } catch (err) {
       summary.errors++;
@@ -1421,12 +1519,19 @@ async function qualifyCountry(countryCode, options = {}) {
   console.log(`[qualify]     - Junk names:    ${exclusionBreakdown.junkNames}`);
   console.log(`[qualify]     - Non-padel:     ${exclusionBreakdown.nonPadel}`);
   console.log(`[qualify]     - Inactive:      ${exclusionBreakdown.inactive}`);
+  console.log(`[qualify]     - 1-court rule:  ${exclusionBreakdown.oneCourtRule}  (tennis/multi-sport with 1 Playtomic court)`);
   console.log(`[qualify]     - Equip shops:   ${exclusionBreakdown.equipmentShop}`);
   console.log(`[qualify]     - Unverifiable:  ${exclusionBreakdown.unverifiable}`);
+  console.log(`[qualify]     - Courts unknown:${exclusionBreakdown.courtCountUnknown}  (tennis/multi-sport → Needs Review)`);
   if (summary.errors > 0) console.log(`[qualify]   Errors:           ${summary.errors}`);
   console.log(`[qualify] ${'='.repeat(50)}`);
 
-  return { ...summary, exclusionBreakdown };
+  if (reportFile) {
+    require('fs').writeFileSync(reportFile, JSON.stringify({ generated: new Date().toISOString(), country: countryCode.toUpperCase(), dryRun, summary: { ...summary, exclusionBreakdown }, decisions: report }, null, 1));
+    console.log(`[qualify] decisions → ${reportFile}`);
+  }
+
+  return { ...summary, exclusionBreakdown, decisions: report };
 }
 
 /**
@@ -1500,6 +1605,7 @@ if (require.main === module) {
     console.log('  node lib/qualify-queue.js AE --dry-run        # preview without updating Notion');
     console.log('  node lib/qualify-queue.js AE --limit 10       # only process 10');
     console.log('  node lib/qualify-queue.js AE --skip-website   # skip website checks (faster)');
+    console.log('  node lib/qualify-queue.js AE --report out.json # write per-venue decisions (any mode)');
     console.log('  node lib/qualify-queue.js single <page-id>    # single venue');
     process.exit(0);
   }
@@ -1523,6 +1629,7 @@ if (require.main === module) {
       limit: args.includes('--limit') ? parseInt(args[args.indexOf('--limit') + 1], 10) : null,
       skipWebsite: args.includes('--skip-website'),
       skipPlaytomic: args.includes('--skip-playtomic'),
+      reportFile: args.includes('--report') ? args[args.indexOf('--report') + 1] : null,
     };
 
     qualifyCountry(countryCode, options)
@@ -1547,5 +1654,7 @@ module.exports = {
   scoreCompleteness,
   detectBrands,
   computePriority,
+  classifyVenueClass,
+  buildQualification,
   updateNotionQualification,
 };

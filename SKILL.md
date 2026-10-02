@@ -131,7 +131,7 @@ This now only pulls "Ready" venues, ranked by priority score.
 | 1. Internal dedup | Same Playtomic ID, coordinates within 100m, same website | Notion data | Exclude duplicates, keep best record |
 | 2. WP dedup | Already published/drafted on padeli.com | WP REST API | Exclude already-live venues |
 | 3. Name cleaning | Junk names, source suffixes, formatting | Text analysis | Fix or exclude |
-| 4. Playtomic check | Tenant active? Courts bookable? | Playtomic API | Exclude inactive, enrich with court/surface data |
+| 4. Playtomic check | Club page resolves (200) and lists > 0 padel courts? | Public club page via `playtomic-data.js` (`api.playtomic.io` is NXDOMAIN) | Exclude inactive (sole source), enrich with court/indoor-outdoor data. Court/venue gate: tennis / multi-sport club with 1 Playtomic court → Excluded `tennis-club-1-court` (Hold Reason); unknown court count → Needs Review |
 | 5. Google Places | Real venue? Rating? Reviews? | Google Places API | Enrich with rating/reviews/Place ID |
 | 6. Website check | Site live? Padel content? Equipment shop? | HTTP + headless Chrome | Exclude equipment shops |
 | 7. Geography | Coordinates in correct country? City name? | Bounding box check | Flag mis-tagged venues |
@@ -149,7 +149,8 @@ After qualification, each venue's Notion row is enriched with:
 - **Verified court count** + **Surface types** + **Indoor/Outdoor**
 - **City (English)** — normalised from Arabic/local names
 - **Brand** — if part of a chain
-- **Notes** — exclusion reason if excluded
+- **Notes** — `[qualify YYYY-MM-DD] <reason>` prepended for Excluded / Needs Review rows; existing notes are kept
+- **Hold Reason** — `tennis-club-1-court` when excluded by the court/venue gate
 
 ---
 
