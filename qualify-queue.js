@@ -448,7 +448,10 @@ function detectInternalDuplicates(venues) {
       for (let j = i + 1; j < cityVenues.length; j++) {
         if (resultMap.get(cityVenues[j].pageId).isDuplicate) continue;
         const sim = stringSimilarity(cityVenues[i].name, cityVenues[j].name);
-        if (sim > 0.80) {
+        // Both geocoded and > 2 km apart = two venues of one brand in the same city, not a duplicate
+        const a = cityVenues[i], b = cityVenues[j];
+        const farApart = a.lat && a.lng && b.lat && b.lng && haversineMetres(a.lat, a.lng, b.lat, b.lng) > 2000;
+        if (sim > 0.80 && !farApart) {
           const keepIdx = fieldCount(cityVenues[i]) >= fieldCount(cityVenues[j]) ? i : j;
           const dropIdx = keepIdx === i ? j : i;
           const r = resultMap.get(cityVenues[dropIdx].pageId);
@@ -468,16 +471,28 @@ function detectInternalDuplicates(venues) {
     if (!byWebsite.has(normalUrl)) byWebsite.set(normalUrl, []);
     byWebsite.get(normalUrl).push(v);
   }
+  // A shared website is only a duplicate signal for the SAME site: chains (Let's Go Padel,
+  // Padel United, The Padel Club, ...) put every venue behind one domain. Require the two
+  // rows to be within 2 km when both are geocoded, or a > 0.6 name match when one is not.
   for (const [, group] of byWebsite) {
     if (group.length < 2) continue;
     group.sort((a, b) => fieldCount(b) - fieldCount(a));
-    const keeper = group[0];
-    for (let i = 1; i < group.length; i++) {
-      if (resultMap.get(group[i].pageId).isDuplicate) continue;
-      const r = resultMap.get(group[i].pageId);
-      r.isDuplicate = true;
-      r.duplicateOf = keeper.pageId;
-      r.reason = `Same website: ${group[i].website}`;
+    for (let k = 0; k < group.length; k++) {
+      const keeper = group[k];
+      if (resultMap.get(keeper.pageId).isDuplicate) continue;
+      for (let i = k + 1; i < group.length; i++) {
+        const cand = group[i];
+        if (resultMap.get(cand.pageId).isDuplicate) continue;
+        const bothGeo = keeper.lat && keeper.lng && cand.lat && cand.lng;
+        const dist = bothGeo ? haversineMetres(keeper.lat, keeper.lng, cand.lat, cand.lng) : null;
+        const sim = stringSimilarity(keeper.name, cand.name);
+        const sameSite = bothGeo ? dist <= 2000 : sim > 0.6;
+        if (!sameSite) continue;
+        const r = resultMap.get(cand.pageId);
+        r.isDuplicate = true;
+        r.duplicateOf = keeper.pageId;
+        r.reason = `Same website: ${cand.website}${bothGeo ? ` (${Math.round(dist)}m apart)` : ` (name similarity ${(sim * 100).toFixed(0)}%, not geocoded)`}`;
+      }
     }
   }
 
@@ -570,7 +585,9 @@ function cleanNames(venues) {
       reason = `Name too short: "${cleaned}"`;
     } else {
       const words = cleaned.toLowerCase().replace(/[^a-z\s]/g, '').trim().split(/\s+/).filter(Boolean);
-      if (words.length > 0 && words.every(w => JUNK_NAMES.includes(w))) {
+      // "Padel 500", "Padel 8" — a number is a distinguishing token, not a generic name
+      const hasNumber = /\d/.test(cleaned);
+      if (words.length > 0 && !hasNumber && words.every(w => JUNK_NAMES.includes(w))) {
         isJunk = true;
         reason = `Generic name only: "${cleaned}"`;
       }
@@ -745,13 +762,25 @@ function deduplicateByPlaceId(venues, layer5Results) {
     return count;
   };
 
+  // Google's top hit for "name + town" collapses a brand's nearby sites onto one place
+  // (Platform Padel Amble vs Alnwick; Pig Pen Padel vs Neo Padel Gainsborough, 17 km apart).
+  // Two rows that each carry a DIFFERENT Playtomic tenant, or that are both geocoded and
+  // > 2 km apart, are distinct venues and are never collapsed.
+  const distinctVenues = (a, b) => {
+    if (a.playtomicId && b.playtomicId && a.playtomicId !== b.playtomicId) return true;
+    if (a.lat && a.lng && b.lat && b.lng && haversineMetres(a.lat, a.lng, b.lat, b.lng) > 2000) return true;
+    return false;
+  };
   for (const [placeId, group] of placeMap) {
     if (group.length < 2) continue;
     // Keep the one with most data
     group.sort((a, b) => fieldCount(b.venue) - fieldCount(a.venue));
-    const keeper = group[0];
+    const keepers = [group[0]];
     for (let i = 1; i < group.length; i++) {
-      const r = resultMap.get(group[i].venue.pageId);
+      const cand = group[i].venue;
+      const keeper = keepers.find(k => !distinctVenues(k.venue, cand));
+      if (!keeper) { keepers.push(group[i]); continue; } // distinct venue sharing a Google hit — keep it
+      const r = resultMap.get(cand.pageId);
       r.isDuplicate = true;
       r.duplicateOf = keeper.venue.pageId;
       r.reason = `Same Google Place ID: ${placeId}`;
@@ -1656,5 +1685,6 @@ module.exports = {
   computePriority,
   classifyVenueClass,
   buildQualification,
+  extractVenue,
   updateNotionQualification,
 };
