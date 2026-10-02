@@ -836,195 +836,59 @@ async function fetchInstagramDiscovery(countryCode) {
   return [];
 }
 
-// ─── Playtomic Name Search ───────────────────────────────────────────────
+// ─── Playtomic Name Search / Tenant Fetch ─────────────────────────────────
+// PORTED 2026-10-02 (t462): api.playtomic.io is NXDOMAIN. Both functions now
+// delegate to lib/playtomic-data.js, which reads the tenant JSON embedded in
+// the public club page https://playtomic.com/clubs/<slug>. Signatures and
+// return shapes are unchanged so Stage 6.5 and the Jakarta drivers (which
+// stub searchPlaytomicByName = async () => null) keep working.
 
 /**
- * Search Playtomic for a specific venue by name (and optionally country).
- * Returns the tenant object if found, or null.
- *
- * Uses the Playtomic search API which supports a query parameter.
- * Falls back to fetching the full country tenant list and matching by name.
+ * Find a venue on Playtomic by name. There is no search API any more, so this
+ * tries the slugified name as a club-page slug (name-guarded, >= 0.6 token
+ * similarity). Returns the enrichment object or null.
  *
  * @param {string} name - Venue name to search for
- * @param {string} [countryCode] - ISO country code to narrow results
- * @returns {Promise<{ playtomic_url: string, tenant_id: string, tenant_name: string, courts: number|null } | null>}
+ * @param {string} [countryCode] - ISO country code (used only to reject a tenant in another country)
+ * @returns {Promise<object|null>} { playtomic_url, tenant_id, tenant_name, courts, indoor_outdoor, opening_hours_raw, images, timezone, booking_type, court_details, ... } | null
  */
 async function searchPlaytomicByName(name, countryCode) {
   if (!name) return null;
-
-  const normalizedSearch = name.toLowerCase().replace(/[^a-z0-9]/g, '');
-
   try {
-    // Fetch all tenants for the country with pagination
-    const baseUrl = countryCode
-      ? `https://api.playtomic.io/v1/tenants?sport_id=PADEL&country_code=${countryCode.toUpperCase()}&size=500`
-      : `https://api.playtomic.io/v1/tenants?sport_id=PADEL&size=500`;
-
-    const data = [];
-    let page = 0;
-    while (true) {
-      const pageData = await fetchWithRetry(`${baseUrl}&page=${page}`);
-      if (!Array.isArray(pageData) || pageData.length === 0) break;
-      data.push(...pageData);
-      if (pageData.length < 200) break;
-      page++;
-      await new Promise(r => setTimeout(r, 300));
+    const pt = require("./playtomic-data");
+    const hit = await pt.guessTenantByName(name);
+    if (!hit) return null;
+    if (isBlocklistedTenant(hit.tenant_id)) return null;
+    if (countryCode && hit.address && hit.address.country_code && hit.address.country_code.toUpperCase() !== String(countryCode).toUpperCase()) {
+      console.log(`  [playtomic-search] "${name}" -> ${hit.tenant_name} is in ${hit.address.country_code}, not ${countryCode} — rejected`);
+      return null;
     }
-
-    if (data.length > 0) {
-      // Find best match — prioritise prefix/substring matches heavily over fuzzy
-      let bestMatch = null;
-      let bestScore = 0;
-
-      for (const t of data) {
-        const tName = (t.tenant_name || t.name || '').trim();
-        const tNorm = tName.toLowerCase().replace(/[^a-z0-9]/g, '');
-        let score = 0;
-
-        // Tier 1: Exact normalized match (highest priority)
-        if (tNorm === normalizedSearch) {
-          score = 2.0;
-        }
-        // Tier 2: Search name is a prefix of Playtomic name (e.g. "ipadel" → "ipadelmelbourne")
-        else if (tNorm.startsWith(normalizedSearch)) {
-          score = 1.5 + (normalizedSearch.length / tNorm.length) * 0.3;
-        }
-        // Tier 3: Playtomic name is a prefix of search name
-        else if (normalizedSearch.startsWith(tNorm) && tNorm.length >= 4) {
-          score = 1.3 + (tNorm.length / normalizedSearch.length) * 0.3;
-        }
-        // Tier 4: Substring match (either direction, non-prefix)
-        else if (tNorm.includes(normalizedSearch) || normalizedSearch.includes(tNorm)) {
-          score = 1.0 + stringSimilarity(name, tName) * 0.3;
-        }
-        // Tier 5: Fuzzy only — needs higher threshold (0.75) to avoid false matches
-        else {
-          const sim = stringSimilarity(name, tName);
-          if (sim > 0.75) {
-            score = sim;
-          }
-        }
-
-        if (score > bestScore) {
-          bestScore = score;
-          bestMatch = t;
-        }
-      }
-
-      if (bestMatch && !isBlocklistedTenant(bestMatch.tenant_id)) {
-        const padelCourts = (bestMatch.resources || []).filter(r => r.sport_id === 'PADEL' && r.is_active !== false);
-        const courtTypes = padelCourts.map(r => r.properties?.resource_type).filter(Boolean);
-        let indoorOutdoor = null;
-        if (courtTypes.length > 0) {
-          const hasIndoor = courtTypes.some(t => t === 'indoor');
-          const hasOutdoor = courtTypes.some(t => t === 'outdoor' || t === 'roofed');
-          if (hasIndoor && hasOutdoor) indoorOutdoor = 'both';
-          else if (hasIndoor) indoorOutdoor = 'indoor';
-          else if (hasOutdoor) indoorOutdoor = 'outdoor';
-        }
-        return {
-          playtomic_url: `https://playtomic.io/tenant/${bestMatch.tenant_id}`,
-          tenant_id: bestMatch.tenant_id,
-          tenant_name: (bestMatch.tenant_name || bestMatch.name || '').trim(),
-          courts: padelCourts.length || bestMatch.properties?.number_of_courts || null,
-          indoor_outdoor: indoorOutdoor,
-          opening_hours_raw: bestMatch.opening_hours || null,
-          images: (bestMatch.images || []).map(img => typeof img === 'string' ? img : (img.url || img.image_url || null)).filter(Boolean),
-          timezone: bestMatch.address?.timezone || null,
-          booking_type: bestMatch.booking_type || null,
-          court_details: padelCourts.map(r => ({
-            name: r.name || null,
-            type: r.properties?.resource_type || null,
-            feature: r.properties?.resource_feature || null,
-          })),
-        };
-      }
-    }
+    return hit;
   } catch (err) {
-    // Silent failure — this is a best-effort enhancement
     console.log(`  [playtomic-search] Search failed for "${name}": ${err.message}`);
+    return null;
   }
-
-  return null;
 }
 
 /**
- * Fetch a single Playtomic tenant by ID. Returns the full rich data object.
- * Use when you already have a tenant_id (from URL or discovery) and want
- * all the venue details: courts, opening hours, images, facilities, etc.
+ * Fetch a single Playtomic tenant by ID (or any Playtomic URL / slug). Returns
+ * the full rich data object used by Stage 6.5, or null.
  *
- * @param {string} tenantId - Playtomic tenant UUID
+ * @param {string} tenantId - Playtomic tenant UUID, slug, or URL
  * @returns {Promise<object|null>} - Rich venue data or null
  */
 async function fetchPlaytomicTenant(tenantId) {
   if (!tenantId) return null;
-
   try {
-    const url = `https://api.playtomic.io/v1/tenants/${tenantId}`;
-    const t = await fetchWithRetry(url);
-    if (!t || !t.tenant_id) return null;
-    if (isBlocklistedTenant(t.tenant_id)) return null;
-
-    // Extract court data from resources[]
-    const padelCourts = (t.resources || []).filter(r => r.sport_id === 'PADEL' && r.is_active !== false);
-
-    // Indoor/outdoor classification
-    const courtTypes = padelCourts.map(r => r.properties?.resource_type).filter(Boolean);
-    let indoorOutdoor = null;
-    if (courtTypes.length > 0) {
-      const hasIndoor = courtTypes.some(ct => ct === 'indoor');
-      const hasOutdoor = courtTypes.some(ct => ct === 'outdoor' || ct === 'roofed');
-      if (hasIndoor && hasOutdoor) indoorOutdoor = 'both';
-      else if (hasIndoor) indoorOutdoor = 'indoor';
-      else if (hasOutdoor) indoorOutdoor = 'outdoor';
+    const pt = require("./playtomic-data");
+    const input = /^[0-9a-f-]{36}$/i.test(tenantId) || /playtomic\./i.test(tenantId) ? tenantId : `https://playtomic.com/clubs/${tenantId}`;
+    const r = await pt.fetchTenant(input);
+    if (!r.tenant) {
+      console.log(`  [playtomic] Tenant fetch failed for ${tenantId}: ${r.error}`);
+      return null;
     }
-
-    // Surface/feature types
-    const courtFeatures = padelCourts.map(r => r.properties?.resource_feature).filter(Boolean);
-    const surfaceType = courtFeatures.length > 0 ? [...new Set(courtFeatures)].join(', ') : null;
-
-    // Images
-    const images = (t.images || []).map(img =>
-      typeof img === 'string' ? img : (img.url || img.image_url || null)
-    ).filter(Boolean);
-
-    // All sports offered (for multi-sport venues)
-    const sportsOffered = (t.sport_ids || []).filter(s => s !== 'PADEL');
-
-    return {
-      tenant_id: t.tenant_id,
-      tenant_name: (t.tenant_name || t.name || '').trim(),
-      playtomic_url: `https://playtomic.io/tenant/${t.tenant_id}`,
-      playtomic_status: t.playtomic_status || t.tenant_status || null,
-      booking_type: t.booking_type || null,
-      courts: padelCourts.length || null,
-      indoor_outdoor: indoorOutdoor,
-      surface_type: surfaceType,
-      timezone: t.address?.timezone || null,
-      currency: t.default_currency || null,
-      opening_hours_raw: t.opening_hours || null,
-      images,
-      court_details: padelCourts.map(r => ({
-        name: r.name || null,
-        type: r.properties?.resource_type || null,
-        size: r.properties?.resource_size || null,
-        feature: r.properties?.resource_feature || null,
-        bookable_online: r.booking_settings?.is_bookable_online || false,
-        allows_onsite_payment: r.booking_settings?.allows_onsite_payment || false,
-        durations: r.booking_settings?.allowed_duration_increments || [],
-      })),
-      cancellation_policy: t.default_cancelation_policy || null,
-      other_sports: sportsOffered,
-      address: {
-        street: t.address?.street || null,
-        city: t.address?.city || null,
-        postal_code: t.address?.postal_code || null,
-        region: t.address?.sub_administrative_area || null,
-        country: t.address?.country || null,
-        lat: t.address?.coordinate?.lat || null,
-        lng: t.address?.coordinate?.lon || null,
-      },
-    };
+    if (isBlocklistedTenant(r.tenant.tenant_id)) return null;
+    return pt.toVenueEnrichment(r.tenant);
   } catch (err) {
     console.log(`  [playtomic] Tenant fetch failed for ${tenantId}: ${err.message}`);
     return null;
