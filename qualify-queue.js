@@ -554,7 +554,7 @@ function cleanNames(venues) {
   const SOURCE_SUFFIXES = [' - Playtomic', ' - Matchi', ' - Google'];
   const JUNK_NAMES = ['padel', 'club', 'sports', 'sport', 'tennis', 'center', 'centre'];
   // Playtomic sandbox/test tenants — always exclude
-  const BLOCKLIST_PATTERNS = [/anemone/i, /test\s*tenant/i, /demo\s*club/i, /sandbox/i];
+  const BLOCKLIST_PATTERNS = [/anemone/i, /test\s*tenant/i, /demo\s*club/i, /sandbox/i, /\btest\b/i, /\bdemo\b/i]; // "Test Padel 2025", "UK Demo Club"
 
   return venues.map(v => {
     let cleaned = v.name || '';
